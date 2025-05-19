@@ -1,12 +1,12 @@
-import { Command } from 'commander';
+import { checkbox, search } from '@inquirer/prompts';
 import axios from 'axios';
-import { XMLParser } from 'fast-xml-parser';
-import { search } from '@inquirer/prompts';
-import * as fs from 'fs';
-import * as path from 'path';
+import { Command } from 'commander';
 import { remove as removeDiacritics } from 'diacritics';
 import * as dotenv from 'dotenv';
-import { Stop, SiriXmlResponse } from './types/siri';
+import { XMLParser } from 'fast-xml-parser';
+import * as fs from 'fs';
+import * as path from 'path';
+import { Stop } from './types/siri';
 
 // Chargement des variables d'environnement
 dotenv.config();
@@ -25,9 +25,9 @@ program
   .name('siri-next-departures-cli')
   .description('CLI pour obtenir les prochains départs via une API SIRI')
   .version('1.0.0')
-  .option('-s, --stop <stopId>', 'ID de l\'arrêt')
-  .option('-l, --limit <number>', 'Nombre maximum de passages à afficher', '5')
-  .option('-f, --find', 'Rechercher un arrêt');
+  .option('-s, --stops <stopIds...>', 'IDs des arrêts')
+  .option('-l, --limit <number>', 'Nombre maximum de passages à afficher par arrêt', '5')
+  .option('-f, --find', 'Rechercher des arrêts');
 
 program.parse(process.argv);
 
@@ -96,47 +96,86 @@ function filterStops(stops: Stop[], searchTerm: string): Stop[] {
   });
 }
 
-async function findStop(): Promise<string | undefined> {
+async function findStops(): Promise<string[]> {
   const stops = await loadStops();
   
-  const searchStops = async (input = '') => {
-    const results = filterStops(stops, input);
-    return results.map(stop => {
-      const correspondances = stop.otherTransportModes.length > 0 
-        ? ` — Correspondances : ${stop.otherTransportModes.join(', ')}`
-        : '';
-      return {
-        name: `${stop.name} — ${stop.transportMode}${correspondances} (${stop.id} ${stop.parentStopPlaceId})`,
-        value: stop.id,
-        description: stop.name
-      };
-    });
+  // Regrouper les arrêts par StopPlace
+  const stopPlaces = new Map<string, { name: string, quays: Stop[] }>();
+  stops.forEach(stop => {
+    if (stop.parentStopPlaceId) {
+      if (!stopPlaces.has(stop.parentStopPlaceId)) {
+        stopPlaces.set(stop.parentStopPlaceId, {
+          name: stop.name.split(' - ')[0], // Prendre le nom du StopPlace (sans le nom du quai)
+          quays: []
+        });
+      }
+      stopPlaces.get(stop.parentStopPlaceId)?.quays.push(stop);
+    }
+  });
+
+  // Recherche du StopPlace
+  const searchStopPlaces = async (input = '') => {
+    const normalizedSearch = normalizeString(input);
+    return Array.from(stopPlaces.entries())
+      .filter(([_, place]) => normalizeString(place.name).includes(normalizedSearch))
+      .map(([id, place]) => ({
+        name: `${place.name} (${place.quays.length} quai${place.quays.length > 1 ? 's' : ''})`,
+        value: id,
+        description: `ID: ${id}`
+      }));
   };
 
-  const selectedStop = await search({
-    message: 'Rechercher un arrêt :',
-    source: searchStops,
+  const selectedStopPlaceId = await search({
+    message: 'Rechercher un arrêt principal :',
+    source: searchStopPlaces,
     pageSize: 10
   });
 
-  return selectedStop;
+  if (!selectedStopPlaceId) {
+    return [];
+  }
+
+  const selectedStopPlace = stopPlaces.get(selectedStopPlaceId);
+  if (!selectedStopPlace) {
+    return [];
+  }
+
+  // Sélection des Quays
+  const quayChoices = selectedStopPlace.quays.map(quay => ({
+    name: `${quay.name} [${quay.id}] — ${quay.transportMode}${quay.otherTransportModes.length > 0 ? ` — Correspondances : ${quay.otherTransportModes.join(', ')}` : ''}`,
+    value: quay.id,
+    description: `ID: ${quay.id}`
+  }));
+
+  const selectedQuays = await checkbox({
+    message: `Sélectionnez les quais de ${selectedStopPlace.name} (utilisez la barre d'espace pour sélectionner, Entrée pour valider) :`,
+    choices: quayChoices,
+    pageSize: 10
+  });
+
+  return selectedQuays;
 }
 
-function generateSiriXml(stopId: string, limit: number): string {
+function generateSiriXml(stopIds: string[], limit: number): string {
+  const stopMonitoringRequests = stopIds.map(stopId => `
+    <StopMonitoringRequest version="2.0">
+      <MonitoringRef>${stopId}</MonitoringRef>
+      <MaximumStopVisits>${limit}</MaximumStopVisits>
+    </StopMonitoringRequest>
+  `).join('');
+
   return `<?xml version="1.0" encoding="utf-8"?>
   <Siri xmlns="http://www.siri.org.uk/siri" xmlns:ns2="http://www.ifopt.org.uk/acsb" xmlns:ns3="http://www.ifopt.org.uk/ifopt" xmlns:ns4="http://da-tex2.eu/schema/2_0RC1/2_0" version="2.0">
       <ServiceRequest>
           <RequestorRef>opendata</RequestorRef>
-          <StopMonitoringRequest version="2.0">
-              <MonitoringRef>${stopId}</MonitoringRef>
-          </StopMonitoringRequest>
+          ${stopMonitoringRequests}
       </ServiceRequest>
   </Siri>`
 }
 
-async function getNextTrams(stopId: string, limit: number) {
+async function getNextTrams(stopIds: string[], limit: number) {
   try {
-    const xmlRequest = generateSiriXml(stopId, limit);
+    const xmlRequest = generateSiriXml(stopIds, limit);
     console.log('Envoi de la requête XML :', xmlRequest);
     
     const response = await axios.post(
@@ -151,7 +190,6 @@ async function getNextTrams(stopId: string, limit: number) {
     );
 
     console.log("Status code :", response.status);
-    // print prettied XML
     console.log(response.data);
 
     const parser = new XMLParser({
@@ -168,27 +206,37 @@ async function getNextTrams(stopId: string, limit: number) {
     }
 
     const serviceDelivery = result.Siri.ServiceDelivery;
-    const stopMonitoring = serviceDelivery.StopMonitoringDelivery;
-    const visits = stopMonitoring?.MonitoredStopVisit;
+    const stopMonitoringDeliveries = Array.isArray(serviceDelivery.StopMonitoringDelivery) 
+      ? serviceDelivery.StopMonitoringDelivery 
+      : [serviceDelivery.StopMonitoringDelivery];
 
-    if (!visits || visits.length === 0) {
-      console.log('Aucun passage prévu pour cet arrêt.');
-      return;
-    }
+    for (const delivery of stopMonitoringDeliveries) {
+      const stopId = delivery.MonitoringRef;
+      const visits = delivery.MonitoredStopVisit;
 
-    console.log('\nProchains passages :\n');
-    visits.forEach((visit: any) => {
-      const journey = visit.MonitoredVehicleJourney;
-      const lineRef = journey.LineRef;
-      const destination = journey.DestinationName["#text"];
-      const expectedTime = new Date(journey.MonitoredCall.ExpectedDepartureTime);
-      const aimedTime = new Date(journey.MonitoredCall.AimedDepartureTime);
+      console.log(`\nArrêt ${stopId} :`);
       
-      console.log(`Ligne ${lineRef} vers ${destination}`);
-      console.log(`Départ prévu : ${expectedTime.toLocaleTimeString()}`);
-      console.log(`Départ théorique : ${aimedTime.toLocaleTimeString()}`);
-      console.log('---');
-    });
+      if (!visits || visits.length === 0) {
+        console.log('Aucun passage prévu pour cet arrêt.');
+        continue;
+      }
+
+      console.log('Prochains passages :\n');
+      visits.forEach((visit: any) => {
+        const journey = visit.MonitoredVehicleJourney;
+        const lineRef = journey.LineRef;
+        const destination = journey.DestinationName["#text"];
+        const expectedTime = new Date(journey.MonitoredCall.ExpectedDepartureTime);
+        const aimedTime = new Date(journey.MonitoredCall.AimedDepartureTime);
+        const quay = journey.MonitoredCall.StopPointRef;
+        
+        console.log(`Ligne ${lineRef} vers ${destination}`);
+        console.log(`Départ prévu : ${expectedTime.toLocaleTimeString()}`);
+        console.log(`Départ théo. : ${aimedTime.toLocaleTimeString()}`);
+        console.log(`Quai : ${quay}`);
+        console.log('---');
+      });
+    }
   } catch (error) {
     if (axios.isAxiosError(error)) {
       console.error('Erreur lors de la récupération des données :', error.response?.data || error.message);
@@ -200,17 +248,18 @@ async function getNextTrams(stopId: string, limit: number) {
 
 async function main() {
   try {
-    let stopId = options.stop;
+    let stopIds = options.stops || [];
     const limit = parseInt(options.limit || '5');
 
-    if (options.find || !stopId) {
-      stopId = await findStop();
-      if (!stopId) {
+    if (options.find || stopIds.length === 0) {
+      const selectedStops = await findStops();
+      if (selectedStops.length === 0) {
         return;
       }
+      stopIds = selectedStops;
     }
 
-    await getNextTrams(stopId, limit);
+    await getNextTrams(stopIds, limit);
   } catch (error) {
     console.error('Erreur :', error);
   }
