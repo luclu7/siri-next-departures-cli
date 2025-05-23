@@ -232,8 +232,8 @@ async function getNextTrams(stopIds: string[], limit: number) {
         const quay = journey.MonitoredCall.StopPointRef;
         
         console.log(`Ligne ${lineRef} vers ${destination}`);
-        console.log(`Départ prévu : ${expectedTime.toLocaleTimeString()}`);
-        console.log(`Départ théo. : ${aimedTime.toLocaleTimeString()}`);
+        console.log(`Départ prévu : ${expectedTime.toLocaleTimeString("fr-FR", { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`);
+        console.log(`Départ théo. : ${aimedTime.toLocaleTimeString("fr-FR", { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`);
         console.log(`Quai : ${quay}`);
         console.log('---');
       });
