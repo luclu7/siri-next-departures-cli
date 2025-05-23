@@ -195,7 +195,8 @@ async function getNextTrams(stopIds: string[], limit: number) {
     const parser = new XMLParser({
       ignoreAttributes: false,
       attributeNamePrefix: '@_',
-      removeNSPrefix: true
+      removeNSPrefix: true,
+      isArray: (name) => name === 'KeyValue' || name === 'MonitoredStopVisit'
     });
 
     const result = parser.parse(response.data);
